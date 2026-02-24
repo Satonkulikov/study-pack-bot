@@ -10,7 +10,6 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-import app
 import main as core  # твой генератор (build_markdown, sanitize_filename и т.д.)
 
 # Состояния диалога
@@ -126,7 +125,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    token = "8501854032:AAGhcD-e9C6FZqsVQ4OPVqyyuE6XYVVm9PM"
+    token = (os.getenv("8501854032:AAGhcD-e9C6FZqsVQ4OPVqyyuE6XYVVm9PM") or "").strip()
     if not token:
         raise SystemExit("Нет BOT_TOKEN. Установи переменную окружения BOT_TOKEN.")
 
