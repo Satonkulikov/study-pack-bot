@@ -125,9 +125,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    token = (os.getenv("8501854032:AAGhcD-e9C6FZqsVQ4OPVqyyuE6XYVVm9PM") or "").strip()
-    if not token:
-        raise SystemExit("Нет BOT_TOKEN. Установи переменную окружения BOT_TOKEN.")
+    token = os.getenv("BOT_TOKEN")
 
     app = Application.builder().token(token).build()
 
