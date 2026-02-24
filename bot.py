@@ -1,6 +1,6 @@
 import os
 import re
-import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime
 
@@ -24,15 +24,28 @@ from reportlab.lib.units import cm
 import main as core  # build_markdown, sanitize_filename
 
 
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("study-pack-bot")
+
+
 # ---------- States ----------
 SUBJECT, TOPIC, TEXT = range(3)
 
 # ---------- Storage ----------
 DATA_DIR = Path("bot_data")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _user_cfg_path(user_id: int) -> Path:
     return DATA_DIR / f"user_{user_id}.txt"
+
 
 def load_user_interests(user_id: int) -> list[str]:
     p = _user_cfg_path(user_id)
@@ -43,21 +56,14 @@ def load_user_interests(user_id: int) -> list[str]:
         return []
     return [x.strip() for x in raw.split(",") if x.strip()][:10]
 
+
 def save_user_interests(user_id: int, interests: list[str]) -> None:
     _user_cfg_path(user_id).write_text(", ".join(interests[:10]), encoding="utf-8")
 
-def normalize_mode(arg: str) -> str:
-    t = (arg or "").strip().lower()
-    if t in {"1", "обычный", "normal"}:
-        return "normal"
-    if t in {"2", "завтра", "tomorrow"}:
-        return "tomorrow"
-    if t in {"3", "неделя", "week"}:
-        return "week"
-    return "normal"
 
 def mode_label(mode: str) -> str:
     return {"normal": "Обычный", "tomorrow": "Контрольная завтра", "week": "Через неделю"}.get(mode, mode)
+
 
 def fmt_label(fmt: str) -> str:
     return {"md": "Markdown (.md)", "pdf": "PDF (.pdf)"}.get(fmt, fmt)
@@ -73,11 +79,10 @@ def md_to_text(md: str) -> str:
     text = text.replace("* ", "• ")
     return text.strip()
 
+
 def save_pdf(text: str, out_path: Path, title: str):
     styles = getSampleStyleSheet()
-    story = []
-    story.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
-    story.append(Spacer(1, 0.4 * cm))
+    story = [Paragraph(f"<b>{title}</b>", styles["Title"]), Spacer(1, 0.4 * cm)]
 
     for line in text.split("\n"):
         line = line.strip()
@@ -103,7 +108,7 @@ def save_pdf(text: str, out_path: Path, title: str):
 # ---------- Smart block ----------
 def smart_block(subject: str, topic: str, text: str) -> str:
     sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
-    hits = []
+    hits: list[tuple[int, str]] = []
     for s in sentences:
         s = s.strip()
         if len(s) < 25:
@@ -162,6 +167,7 @@ def main_menu_kb(mode: str, fmt: str) -> InlineKeyboardMarkup:
         ],
     ])
 
+
 def mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("1) Обычный", callback_data="setmode:normal")],
@@ -169,6 +175,7 @@ def mode_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("3) Через неделю", callback_data="setmode:week")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu:back")],
     ])
+
 
 def format_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -187,22 +194,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_kb(mode, fmt),
     )
 
+
 async def study_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1) Напиши предмет (например: Физика):")
     return SUBJECT
 
+
 async def got_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["subject"] = update.message.text.strip()
+    context.user_data["subject"] = (update.message.text or "").strip()
     await update.message.reply_text("2) Теперь тема (например: Закон Ома):")
     return TOPIC
 
+
 async def got_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["topic"] = update.message.text.strip()
+    context.user_data["topic"] = (update.message.text or "").strip()
     context.user_data["text_parts"] = []
     await update.message.reply_text(
         "3) Вставь текст параграфа.\nМожно несколькими сообщениями.\nКогда закончишь — отправь: DONE"
     )
     return TEXT
+
 
 async def got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (update.message.text or "").strip()
@@ -210,8 +221,33 @@ async def got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_text = "\n".join(context.user_data.get("text_parts", [])).strip()
         return await generate_and_send(update, context, full_text)
 
-    context.user_data.setdefault("text_parts", []).append(msg)
+    if msg:
+        context.user_data.setdefault("text_parts", []).append(msg)
     return TEXT
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ок, отменил. Чтобы начать снова — /study")
+    return ConversationHandler.END
+
+
+# ---------- Interests capture ----------
+async def interests_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_interests"):
+        return
+
+    raw = (update.message.text or "").strip()
+    interests = [x.strip() for x in raw.split(",") if x.strip()][:10]
+    save_user_interests(update.effective_user.id, interests)
+
+    context.user_data["awaiting_interests"] = False
+
+    mode = context.user_data.get("mode", "normal")
+    fmt = context.user_data.get("fmt", "md")
+    await update.message.reply_text(
+        f"✅ Сохранил интересы: {', '.join(interests) if interests else '—'}",
+        reply_markup=main_menu_kb(mode, fmt),
+    )
 
 
 # ---------- Callback handlers ----------
@@ -223,6 +259,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fmt = context.user_data.get("fmt", "md")
 
     if q.data == "menu:study":
+        # ВАЖНО: это entry_point ConversationHandler (см. main())
         await q.message.reply_text("1) Напиши предмет (например: Физика):")
         return SUBJECT
 
@@ -235,6 +272,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if q.data == "menu:interests":
+        context.user_data["awaiting_interests"] = True
         await q.message.reply_text("Напиши интересы одной строкой через запятую.\nПример: игры, спорт, машины")
         return ConversationHandler.END
 
@@ -254,6 +292,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Меню:", reply_markup=main_menu_kb(mode, fmt))
         return ConversationHandler.END
 
+
 async def on_set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -261,6 +300,7 @@ async def on_set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = mode
     fmt = context.user_data.get("fmt", "md")
     await q.message.reply_text(f"✅ Режим: {mode_label(mode)}", reply_markup=main_menu_kb(mode, fmt))
+
 
 async def on_set_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -289,44 +329,49 @@ async def generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     md = core.build_markdown(subject, topic, text, mode, cfg)
     md += smart_block(subject, topic, text)
 
-    out_dir = Path("output")
-    out_dir.mkdir(exist_ok=True)
-
     safe_topic = core.sanitize_filename(topic)
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     if fmt == "pdf":
         filename = f"study_pack_{safe_topic}_{stamp}.pdf"
-        out_path = out_dir / filename
+        out_path = OUTPUT_DIR / filename
         title = f"Study pack: {subject} — {topic}"
         plain = md_to_text(md)
         save_pdf(plain, out_path, title)
     else:
         filename = f"study_pack_{safe_topic}_{stamp}.md"
-        out_path = out_dir / filename
+        out_path = OUTPUT_DIR / filename
         out_path.write_text(md, encoding="utf-8")
 
-    await update.message.reply_document(
-        document=open(out_path, "rb"),
-        filename=filename,
-        caption=f"Готово ✅\nРежим: {mode_label(mode)}\nФормат: {fmt_label(fmt)}",
-    )
+    with open(out_path, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=filename,
+            caption=f"Готово ✅\nРежим: {mode_label(mode)}\nФормат: {fmt_label(fmt)}",
+        )
 
     await update.message.reply_text("Ещё раз?", reply_markup=main_menu_kb(mode, fmt))
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ок, отменил. Чтобы начать снова — /study")
-    return ConversationHandler.END
+# ---------- Error handler ----------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error", exc_info=context.error)
 
 
 def main():
     token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is not set")
+
     app = Application.builder().token(token).build()
+    app.add_error_handler(on_error)
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("study", study_cmd)],
+        entry_points=[
+            CommandHandler("study", study_cmd),
+            CallbackQueryHandler(on_menu, pattern=r"^menu:study$"),
+        ],
         states={
             SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_subject)],
             TOPIC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_topic)],
@@ -337,16 +382,20 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("study", study_cmd))
 
+    # Меню/настройки
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_set_mode, pattern=r"^setmode:"))
     app.add_handler(CallbackQueryHandler(on_set_fmt, pattern=r"^setfmt:"))
 
+    # Диалог создания study pack
     app.add_handler(conv)
 
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling()
+    # Сохранение интересов (срабатывает только когда awaiting_interests=True)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, interests_text))
+
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+
 
 if __name__ == "__main__":
     main()
