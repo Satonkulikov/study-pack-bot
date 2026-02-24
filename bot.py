@@ -2,27 +2,40 @@ import os
 import re
 import asyncio
 from pathlib import Path
+from datetime import datetime
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-import main as core  # твой генератор (build_markdown, sanitize_filename и т.д.)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.units import cm
 
-# Состояния диалога
+import main as core  # build_markdown, sanitize_filename
+
+
+# ---------- States ----------
 SUBJECT, TOPIC, TEXT = range(3)
 
+# ---------- Storage ----------
 DATA_DIR = Path("bot_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-def user_cfg_path(user_id: int) -> Path:
+def _user_cfg_path(user_id: int) -> Path:
     return DATA_DIR / f"user_{user_id}.txt"
 
 def load_user_interests(user_id: int) -> list[str]:
-    p = user_cfg_path(user_id)
+    p = _user_cfg_path(user_id)
     if not p.exists():
         return []
     raw = p.read_text(encoding="utf-8").strip()
@@ -30,11 +43,11 @@ def load_user_interests(user_id: int) -> list[str]:
         return []
     return [x.strip() for x in raw.split(",") if x.strip()][:10]
 
-def save_user_interests(user_id: int, interests: list[str]):
-    user_cfg_path(user_id).write_text(", ".join(interests[:10]), encoding="utf-8")
+def save_user_interests(user_id: int, interests: list[str]) -> None:
+    _user_cfg_path(user_id).write_text(", ".join(interests[:10]), encoding="utf-8")
 
-def normalize_mode(text: str) -> str:
-    t = text.strip().lower()
+def normalize_mode(arg: str) -> str:
+    t = (arg or "").strip().lower()
     if t in {"1", "обычный", "normal"}:
         return "normal"
     if t in {"2", "завтра", "tomorrow"}:
@@ -43,34 +56,138 @@ def normalize_mode(text: str) -> str:
         return "week"
     return "normal"
 
+def mode_label(mode: str) -> str:
+    return {"normal": "Обычный", "tomorrow": "Контрольная завтра", "week": "Через неделю"}.get(mode, mode)
+
+def fmt_label(fmt: str) -> str:
+    return {"md": "Markdown (.md)", "pdf": "PDF (.pdf)"}.get(fmt, fmt)
+
+
+# ---------- PDF helpers ----------
+def md_to_text(md: str) -> str:
+    text = md
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"^#+\s*", "", text, flags=re.M)
+    text = text.replace("**", "")
+    text = text.replace("* ", "• ")
+    return text.strip()
+
+def save_pdf(text: str, out_path: Path, title: str):
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
+    story.append(Spacer(1, 0.4 * cm))
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 0.15 * cm))
+            continue
+        safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph(safe, styles["BodyText"]))
+
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=A4,
+        leftMargin=2 * cm,
+        rightMargin=2 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+        title=title,
+        author="Study Pack Bot",
+    )
+    doc.build(story)
+
+
+# ---------- Smart block ----------
+def smart_block(subject: str, topic: str, text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    hits = []
+    for s in sentences:
+        s = s.strip()
+        if len(s) < 25:
+            continue
+        score = 0
+        if re.search(r"\d", s):
+            score += 2
+        if re.search(r"=|≈|→|->", s):
+            score += 2
+        if re.search(r"\b(это|называется|определ|формул|закон|причин|следств|дата)\b", s, re.I):
+            score += 1
+        if score >= 2:
+            hits.append((score, s))
+
+    hits.sort(key=lambda x: x[0], reverse=True)
+    top = [h[1] for h in hits[:5]]
+
+    mistakes = [
+        "Путают определения и примеры — проговори определение своими словами.",
+        "Учат без понимания причин/связей — попробуй объяснить «почему так».",
+        "Не умеют применить к задаче/ситуации — реши 2–3 мини-примера.",
+    ]
+
+    md = "\n\n## 🧠 Умный блок\n"
+    md += "### 5 опорных мыслей\n"
+    if top:
+        for t in top:
+            md += f"- {t}\n"
+    else:
+        md += "- Выпиши 5 терминов и объясни каждый одной фразой.\n"
+        md += "- Найди 2 причины/следствия или 2 главных правила темы.\n"
+        md += "- Придумай 2 примера применения.\n"
+
+    md += "\n### Типичные ошибки\n"
+    for m in mistakes:
+        md += f"- {m}\n"
+
+    md += "\n### 3 вопроса на понимание\n"
+    md += "- Объясни тему так, будто учишь друга (1–2 минуты).\n"
+    md += "- Приведи свой пример (не из текста) и объясни, почему он подходит.\n"
+    md += "- Что изменится, если поменять одно условие/факт?\n"
+    return md
+
+
+# ---------- Keyboards ----------
+def main_menu_kb(mode: str, fmt: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 Создать study pack", callback_data="menu:study")],
+        [
+            InlineKeyboardButton(f"⏱ Режим: {mode_label(mode)}", callback_data="menu:mode"),
+            InlineKeyboardButton(f"📄 Формат: {fmt_label(fmt)}", callback_data="menu:format"),
+        ],
+        [
+            InlineKeyboardButton("⭐ Интересы", callback_data="menu:interests"),
+            InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help"),
+        ],
+    ])
+
+def mode_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1) Обычный", callback_data="setmode:normal")],
+        [InlineKeyboardButton("2) Контрольная завтра", callback_data="setmode:tomorrow")],
+        [InlineKeyboardButton("3) Через неделю", callback_data="setmode:week")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu:back")],
+    ])
+
+def format_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Markdown (.md)", callback_data="setfmt:md")],
+        [InlineKeyboardButton("🧾 PDF (.pdf)", callback_data="setfmt:pdf")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu:back")],
+    ])
+
+
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("mode", "normal")
+    fmt = context.user_data.get("fmt", "md")
     await update.message.reply_text(
-        "Привет! Я сделаю study boost.\n\n"
-        "Команды:\n"
-        "/study — создать study boost\n"
-        "/interests игры, спорт, машины — сохранить интересы\n"
-        "/mode 1|2|3 — режим (1 обычный, 2 завтра, 3 неделя)\n"
-        "/cancel — отмена"
+        "Привет! Я сделаю study pack по твоему тексту.\nЖми кнопки 👇",
+        reply_markup=main_menu_kb(mode, fmt),
     )
 
-async def set_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    raw = update.message.text.replace("/interests", "", 1).strip()
-    if not raw:
-        await update.message.reply_text("Напиши так: /interests игры, спорт, машины")
-        return
-    interests = [x.strip() for x in re.split(r"[,\|;/]+", raw) if x.strip()]
-    save_user_interests(user_id, interests)
-    await update.message.reply_text(f"Сохранил интересы: {', '.join(interests[:10])}")
-
-async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.replace("/mode", "", 1).strip()
-    mode = normalize_mode(raw)
-    context.user_data["mode"] = mode
-    label = {"normal":"Обычный", "tomorrow":"Завтра", "week":"Неделя"}[mode]
-    await update.message.reply_text(f"Режим установлен: {label}")
-
-async def study(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def study_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("1) Напиши предмет (например: Физика):")
     return SUBJECT
 
@@ -81,72 +198,154 @@ async def got_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def got_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["topic"] = update.message.text.strip()
+    context.user_data["text_parts"] = []
     await update.message.reply_text(
-        "3) Вставь текст параграфа одним сообщением.\n"
-        "Можно большим куском."
+        "3) Вставь текст параграфа.\nМожно несколькими сообщениями.\nКогда закончишь — отправь: DONE"
     )
     return TEXT
 
 async def got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    subject = context.user_data.get("subject", "").strip()
-    topic = context.user_data.get("topic", "").strip()
-    text = update.message.text.strip()
+    msg = (update.message.text or "").strip()
+    if msg.upper() == "DONE":
+        full_text = "\n".join(context.user_data.get("text_parts", [])).strip()
+        return await generate_and_send(update, context, full_text)
 
+    context.user_data.setdefault("text_parts", []).append(msg)
+    return TEXT
+
+
+# ---------- Callback handlers ----------
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    mode = context.user_data.get("mode", "normal")
+    fmt = context.user_data.get("fmt", "md")
+
+    if q.data == "menu:study":
+        await q.message.reply_text("1) Напиши предмет (например: Физика):")
+        return SUBJECT
+
+    if q.data == "menu:mode":
+        await q.message.reply_text("Выбери режим:", reply_markup=mode_kb())
+        return ConversationHandler.END
+
+    if q.data == "menu:format":
+        await q.message.reply_text("Выбери формат:", reply_markup=format_kb())
+        return ConversationHandler.END
+
+    if q.data == "menu:interests":
+        await q.message.reply_text("Напиши интересы одной строкой через запятую.\nПример: игры, спорт, машины")
+        return ConversationHandler.END
+
+    if q.data == "menu:help":
+        await q.message.reply_text(
+            "Как пользоваться:\n"
+            "1) Нажми «Создать study pack»\n"
+            "2) Введи предмет и тему\n"
+            "3) Отправь текст (можно несколькими сообщениями)\n"
+            "4) Когда закончил — отправь DONE\n\n"
+            "Можно и командами: /study",
+            reply_markup=main_menu_kb(mode, fmt),
+        )
+        return ConversationHandler.END
+
+    if q.data == "menu:back":
+        await q.message.reply_text("Меню:", reply_markup=main_menu_kb(mode, fmt))
+        return ConversationHandler.END
+
+async def on_set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    mode = (q.data or "").split(":", 1)[1]
+    context.user_data["mode"] = mode
+    fmt = context.user_data.get("fmt", "md")
+    await q.message.reply_text(f"✅ Режим: {mode_label(mode)}", reply_markup=main_menu_kb(mode, fmt))
+
+async def on_set_fmt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    fmt = (q.data or "").split(":", 1)[1]
+    context.user_data["fmt"] = fmt
+    mode = context.user_data.get("mode", "normal")
+    await q.message.reply_text(f"✅ Формат: {fmt_label(fmt)}", reply_markup=main_menu_kb(mode, fmt))
+
+
+# ---------- Generate & send ----------
+async def generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    subject = (context.user_data.get("subject") or "").strip()
+    topic = (context.user_data.get("topic") or "").strip()
     if not subject or not topic or not text:
-        await update.message.reply_text("Что-то пустое. Давай заново: /study")
+        await update.message.reply_text("Пусто. Начни заново: /study")
         return ConversationHandler.END
 
     mode = context.user_data.get("mode", "normal")
-    interests = load_user_interests(user_id)
+    fmt = context.user_data.get("fmt", "md")
+    interests = load_user_interests(update.effective_user.id)
     cfg = {"interests": interests}
 
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+    await update.message.chat.send_action(ChatAction.TYPING)
 
     md = core.build_markdown(subject, topic, text, mode, cfg)
+    md += smart_block(subject, topic, text)
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    filename = f"study_pack_{core.sanitize_filename(topic)}.md"
-    out_path = out_dir / filename
-    out_path.write_text(md, encoding="utf-8")
 
-    # Отправляем файл
+    safe_topic = core.sanitize_filename(topic)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    if fmt == "pdf":
+        filename = f"study_pack_{safe_topic}_{stamp}.pdf"
+        out_path = out_dir / filename
+        title = f"Study pack: {subject} — {topic}"
+        plain = md_to_text(md)
+        save_pdf(plain, out_path, title)
+    else:
+        filename = f"study_pack_{safe_topic}_{stamp}.md"
+        out_path = out_dir / filename
+        out_path.write_text(md, encoding="utf-8")
+
     await update.message.reply_document(
         document=open(out_path, "rb"),
         filename=filename,
-        caption=f"Готово ✅\nПредмет: {subject}\nТема: {topic}"
+        caption=f"Готово ✅\nРежим: {mode_label(mode)}\nФормат: {fmt_label(fmt)}",
     )
 
+    await update.message.reply_text("Ещё раз?", reply_markup=main_menu_kb(mode, fmt))
     return ConversationHandler.END
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ок, отменил. Чтобы начать снова: /study")
+    await update.message.reply_text("Ок, отменил. Чтобы начать снова — /study")
     return ConversationHandler.END
+
 
 def main():
     token = os.getenv("BOT_TOKEN")
-
     app = Application.builder().token(token).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("study", study)],
+        entry_points=[CommandHandler("study", study_cmd)],
         states={
             SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_subject)],
             TOPIC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_topic)],
             TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_text)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("interests", set_interests))
-    app.add_handler(CommandHandler("mode", set_mode))
-    app.add_handler(conv)
-    
-    import asyncio
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    app.add_handler(CommandHandler("study", study_cmd))
 
+    app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(on_set_mode, pattern=r"^setmode:"))
+    app.add_handler(CallbackQueryHandler(on_set_fmt, pattern=r"^setfmt:"))
+
+    app.add_handler(conv)
+
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling()
 
 if __name__ == "__main__":
